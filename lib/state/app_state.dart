@@ -508,6 +508,15 @@ class AppState extends ChangeNotifier {
   /// Size of the loaded personal like list (0 while guest or not yet loaded).
   int get likedCount => _likedSongIds.length;
 
+  /// Whether [track] sits in the personal like list.
+  ///
+  /// Rows show the favourite toggle for any song, not only the one playing,
+  /// so [currentLiked] is not enough here.
+  bool isLiked(Track track) {
+    final int? id = int.tryParse(track.id);
+    return id != null && _likedSongIds.contains(id);
+  }
+
   /// Whether the gateway was reachable on the last interaction.
   bool get online => catalog.online;
 
@@ -973,6 +982,11 @@ class AppState extends ChangeNotifier {
   /// Identifier of the engine queue the appends belong to.
   int? _queueId;
 
+  /// Serializes queue mutations against each other and against the prefetch
+  /// append. A "play next" insert racing an append would otherwise leave the
+  /// engine holding a track the app no longer expects in that slot.
+  Future<void> _queueChain = Future<void>.value();
+
   Future<List<Track>> Function()? _stationLoader;
   bool _stationLoading = false;
   final Set<String> _stationSeen = <String>{};
@@ -1288,6 +1302,77 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Schedules [track] right after the one playing — the "play next" action.
+  ///
+  /// A track already waiting further down the queue is moved up instead of
+  /// duplicated, so repeated use cannot pile the same song into the queue.
+  /// Returns true when it started playing instead (nothing was queued).
+  bool queueNext(Track track) {
+    if (track.id.isEmpty) return false;
+    if (_queue.isEmpty) {
+      playQueue(<Track>[track]);
+      return true;
+    }
+    if (_queue[_queueIndex].id == track.id) return false;
+    int insertAt = _queueIndex + 1;
+    final int existing = _queue.indexWhere(
+      (Track entry) => entry.id == track.id,
+    );
+    if (existing >= 0) {
+      // Already scheduled: move the entry, never add a second copy.
+      if (existing == insertAt) return false;
+      _queue.removeAt(existing);
+      if (existing < insertAt) insertAt -= 1;
+    }
+    _queue.insert(insertAt, track);
+    // The engine's next slot no longer matches the app's: re-arm it below.
+    _queuedNextIndex = null;
+    unawaited(_saveQueue());
+    notifyListeners();
+    unawaited(_serializeQueue(() => _armQueuedNext(insertAt, track.id)));
+    return false;
+  }
+
+  /// Appends [track] to the tail of the queue — the "add to queue" action.
+  ///
+  /// A song is allowed to appear twice this way, matching how players treat the
+  /// end of the queue as a plain list. Returns true when it started playing.
+  bool enqueueTrack(Track track) {
+    if (track.id.isEmpty) return false;
+    if (_queue.isEmpty) {
+      playQueue(<Track>[track]);
+      return true;
+    }
+    _queue.add(track);
+    unawaited(_saveQueue());
+    notifyListeners();
+    // A single-track queue had no next slot to prefetch before this append.
+    unawaited(_prefetchNext());
+    return false;
+  }
+
+  /// Drops the pending entry at [index] — the queue row's "remove" action.
+  ///
+  /// Only entries after the one playing can be dropped: the current track and
+  /// already-played history are refused, so a stray tap cannot rewind the
+  /// queue. Returns false when nothing was removed.
+  bool removeQueuedAt(int index) {
+    if (index <= _queueIndex || index >= _queue.length) return false;
+    _queue.removeAt(index);
+    final int? hint = _queuedNextIndex;
+    if (hint != null && hint == index) {
+      // The engine held exactly the entry that just left: replace it so the
+      // gapless hand-off still lands on the app's next track.
+      _queuedNextIndex = null;
+      unawaited(_serializeQueue(_rearmAfterRemoval));
+    } else if (hint != null && hint > index) {
+      _queuedNextIndex = hint - 1;
+    }
+    unawaited(_saveQueue());
+    notifyListeners();
+    return true;
+  }
+
   void playTrackAt(int index) {
     if (index < 0 || index >= _queue.length) return;
     trackChangeDirection = index < _queueIndex ? -1 : 1;
@@ -1362,10 +1447,15 @@ class AppState extends ChangeNotifier {
   ///
   /// The queue engine is optional: with a plain [AudioEngine] this is a no-op
   /// and playback keeps the load-on-completion path.
-  Future<void> _prefetchNext() async {
+  Future<void> _prefetchNext() => _serializeQueue(_prefetchNextImpl);
+
+  Future<void> _prefetchNextImpl() async {
     final QueueAudioEngine? engine = _queueEngine;
     final int? queueId = _queueId;
     if (engine == null || queueId == null || _queue.isEmpty) return;
+    // A "play next" insert already filled this slot; appending once more would
+    // hand the engine a track the app does not treat as the next one.
+    if (_queuedNextIndex != null) return;
     final int? next = _autoAdvanceIndex();
     if (next == null) {
       _queuedNextIndex = null;
@@ -1390,6 +1480,67 @@ class AppState extends ChangeNotifier {
     if (!appended || queueId != _queueId) return;
     _queuedNextIndex = next;
   }
+
+  /// Runs [op] after every queue operation already handed to the engine.
+  ///
+  /// A failure is swallowed for the chain itself: one refused append must not
+  /// keep later mutations from reaching the engine.
+  Future<T> _serializeQueue<T>(Future<T> Function() op) {
+    final Future<T> result = _queueChain.then((_) => op());
+    _queueChain = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
+  /// Hands the freshly scheduled track to the engine's next slot.
+  ///
+  /// Runs inside the queue chain. The engine keeps only the current track plus
+  /// its successor, so no index is sent — the slot is always the one right
+  /// after the current track.
+  Future<void> _armQueuedNext(int index, String trackId) async {
+    final QueueAudioEngine? engine = _queueEngine;
+    final int? queueId = _queueId;
+    if (engine == null || queueId == null || !_realActive) return;
+    if (!_holdsAt(index, trackId)) return;
+    String? url;
+    try {
+      url = await catalog.audioUrlFor(_queue[index]);
+    } catch (_) {
+      url = null;
+    }
+    // A track change while the URL was in flight owns the next slot now.
+    if (queueId != _queueId || !_realActive) return;
+    if (url == null || url.isEmpty) return;
+    bool inserted;
+    try {
+      inserted = await engine.insertQueuedNext(queueId, url);
+    } catch (_) {
+      inserted = false;
+    }
+    if (!inserted || queueId != _queueId) return;
+    if (index != _queueIndex + 1 || !_holdsAt(index, trackId)) return;
+    _queuedNextIndex = index;
+  }
+
+  /// Replaces the engine's next slot after the track it held left the queue.
+  Future<void> _rearmAfterRemoval() async {
+    final QueueAudioEngine? engine = _queueEngine;
+    final int? queueId = _queueId;
+    if (engine != null && queueId != null) {
+      try {
+        await engine.removeQueuedAt(queueId, 1);
+      } catch (_) {
+        // Even if the engine refuses, the append below overwrites the slot.
+      }
+    }
+    await _prefetchNextImpl();
+  }
+
+  /// Whether [trackId] still sits at queue index [index].
+  bool _holdsAt(int index, String trackId) =>
+      index >= 0 && index < _queue.length && _queue[index].id == trackId;
 
   /// Crosses into the track the engine already holds next, without reloading.
   Future<void> _crossIntoQueuedTrack() async {
@@ -1642,6 +1793,34 @@ class AppState extends ChangeNotifier {
         _likedSongIds.remove(id);
       }
       // The next entry into the liked playlist must reflect this mutation.
+      final playlistId = collections.liked?.id;
+      if (playlistId != null) await catalog.invalidatePlaylist(playlistId);
+      await catalog.invalidateCollections(_user.userId);
+    } catch (_) {
+      likeError = '收藏失败，请稍后重试。';
+    }
+    notifyListeners();
+  }
+
+  /// Toggles the personal like state of [track], whoever happens to be playing.
+  ///
+  /// The transport button only knows the current track; the row menu targets
+  /// any song in a list. The mutations (like list, playlist caches) are the
+  /// same as [toggleLikeCurrent], so both paths stay consistent.
+  Future<void> toggleLike(Track track) async {
+    final int? id = int.tryParse(track.id);
+    final int uid = _user.userId;
+    if (id == null || uid <= 0) return;
+    final bool liked = !_likedSongIds.contains(id);
+    likeError = null;
+    try {
+      await gateway.setSongLiked(id, uid, liked);
+      if (_user.userId != uid) return;
+      if (liked) {
+        _likedSongIds.add(id);
+      } else {
+        _likedSongIds.remove(id);
+      }
       final playlistId = collections.liked?.id;
       if (playlistId != null) await catalog.invalidatePlaylist(playlistId);
       await catalog.invalidateCollections(_user.userId);

@@ -36,6 +36,21 @@ abstract interface class QueueAudioEngine {
   /// knows the append did not happen and must not expect the hand-off.
   Future<bool> appendToQueue(int queueId, String url);
 
+  /// Places [url] immediately after the item the queue currently sits on,
+  /// replacing whatever the engine had queued there.
+  ///
+  /// Used by "play next": the app queue gains an entry in the middle, so the
+  /// track already handed to the engine would otherwise play at the wrong
+  /// moment. Returns false when [queueId] is stale or the engine cannot insert
+  /// ahead of an item, in which case the app falls back to reloading the URL.
+  Future<bool> insertQueuedNext(int queueId, String url);
+
+  /// Drops item [index] from the queue installed under [queueId].
+  ///
+  /// Returns false when [queueId] is stale or [index] is out of range; the
+  /// caller then keeps the engine's view and reloads on the next track change.
+  Future<bool> removeQueuedAt(int queueId, int index);
+
   /// Moves to the next item of the loaded queue without reloading it.
   Future<void> playQueuedNext();
 
@@ -66,7 +81,8 @@ abstract class AudioEngine {
 }
 
 /// just_audio-backed engine used by the real app.
-class JustAudioEngine implements AudioEngine, BufferedAudioEngine, QueueAudioEngine {
+class JustAudioEngine
+    implements AudioEngine, BufferedAudioEngine, QueueAudioEngine {
   JustAudioEngine({AudioPlayer? player, this.activateSession})
     : _player =
           player ??
@@ -209,6 +225,39 @@ class JustAudioEngine implements AudioEngine, BufferedAudioEngine, QueueAudioEng
       final ConcatenatingAudioSource? queue = _queue;
       if (queue == null || queueId != _queueId) return false;
       await queue.add(AudioSource.uri(Uri.parse(url)));
+      return queueId == _queueId;
+    });
+  }
+
+  @override
+  Future<bool> insertQueuedNext(int queueId, String url) {
+    return _serialize(() async {
+      final ConcatenatingAudioSource? queue = _queue;
+      if (queue == null || queueId != _queueId) return false;
+      final int? current = _player.currentIndex;
+      if (current == null) return false;
+      final int target = current + 1;
+      // The prefetch may already have appended its own "next"; the queue
+      // operation replaces that slot rather than growing past it.
+      if (target < queue.children.length) await queue.removeAt(target);
+      await queue.insert(target, AudioSource.uri(Uri.parse(url)));
+      return queueId == _queueId;
+    });
+  }
+
+  @override
+  Future<bool> removeQueuedAt(int queueId, int index) {
+    return _serialize(() async {
+      final ConcatenatingAudioSource? queue = _queue;
+      if (queue == null || queueId != _queueId) return false;
+      if (index < 0 || index >= queue.children.length) return false;
+      // Removing the item the decoder sits on would tear the stream down, so
+      // the caller is expected never to ask for it; guard here anyway.
+      final int? current = _player.currentIndex;
+      if (current == index) return false;
+      await queue.removeAt(index);
+      final int? after = _player.currentIndex;
+      if (after != null) _commandedIndex = after;
       return queueId == _queueId;
     });
   }

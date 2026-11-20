@@ -19,6 +19,12 @@ class _QueueEngine implements AudioEngine, QueueAudioEngine {
   /// URLs appended for a gapless hand-off, in call order.
   final List<String> appends = <String>[];
 
+  /// URLs written into the slot right after the current track, in call order.
+  final List<String> inserts = <String>[];
+
+  /// Engine indexes asked to leave the queue, in call order.
+  final List<int> removals = <int>[];
+
   int jumps = 0;
   int stops = 0;
   int _queueId = 0;
@@ -44,6 +50,20 @@ class _QueueEngine implements AudioEngine, QueueAudioEngine {
   Future<bool> appendToQueue(int queueId, String url) async {
     if (queueId != _queueId) return false;
     appends.add(url);
+    return true;
+  }
+
+  @override
+  Future<bool> insertQueuedNext(int queueId, String url) async {
+    if (queueId != _queueId) return false;
+    inserts.add(url);
+    return true;
+  }
+
+  @override
+  Future<bool> removeQueuedAt(int queueId, int index) async {
+    if (queueId != _queueId || index < 1) return false;
+    removals.add(index);
     return true;
   }
 
@@ -160,13 +180,13 @@ class _Catalog extends Catalog {
 }
 
 Track _track(String id) => Track(
-      id: id,
-      title: 'Track $id',
-      artist: 'Artist',
-      album: 'Album',
-      duration: const Duration(minutes: 3),
-      coverSeed: 1,
-    );
+  id: id,
+  title: 'Track $id',
+  artist: 'Artist',
+  album: 'Album',
+  duration: const Duration(minutes: 3),
+  coverSeed: 1,
+);
 
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
@@ -243,8 +263,14 @@ void main() {
     await tester.pump();
 
     expect(loads, 1);
-    expect(state.queue.map((track) => track.id),
-        <String>['1', '2', '3', '4', '5', '6']);
+    expect(state.queue.map((track) => track.id), <String>[
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+      '6',
+    ]);
     state.dispose();
   });
 
