@@ -1,4 +1,4 @@
-﻿import 'package:flutter/cupertino.dart'
+import 'package:flutter/cupertino.dart'
     show CupertinoPageTransitionsBuilder, CupertinoTextThemeData, CupertinoThemeData;
 import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
@@ -601,6 +601,10 @@ ThemeData buildAppleTheme({
       actionTextColor: apple.accent,
       behavior: SnackBarBehavior.floating,
       elevation: 16,
+      width: 360,
+      // The player bar sits at the bottom of the shell, so keep the toast
+      // clear of it instead of covering the controls.
+      insetPadding: const EdgeInsets.fromLTRB(16, 12, 16, 92),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
     ),
     tooltipTheme: TooltipThemeData(

@@ -1,8 +1,12 @@
-﻿import 'package:flutter/material.dart';
+import 'dart:async';
+
+import 'package:flutter/material.dart';
 
 import '../data/models.dart';
+import '../state/app_state.dart';
 import '../theme/apple_design.dart';
 import '../widgets/interaction_feedback.dart';
+import '../widgets/track_context_menu.dart';
 import '../utils/artwork.dart';
 import '../widgets/apple_ui.dart';
 import '../widgets/artwork_image.dart';
@@ -53,10 +57,7 @@ class LegacyCover extends StatelessWidget {
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: <Color>[
-            apple.tertiaryFill,
-            apple.secondaryFill,
-          ],
+          colors: <Color>[apple.tertiaryFill, apple.secondaryFill],
         ),
         borderRadius: BorderRadius.circular(radius),
       ),
@@ -87,7 +88,10 @@ class LegacyCover extends StatelessWidget {
     return DecoratedBox(
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(radius),
-        border: Border.all(color: apple.separator.withValues(alpha: .35), width: .5),
+        border: Border.all(
+          color: apple.separator.withValues(alpha: .35),
+          width: .5,
+        ),
       ),
       child: clipped,
     );
@@ -124,8 +128,7 @@ class _LegacyPlaylistCardState extends State<LegacyPlaylistCard> {
     final String detail =
         widget.subtitle ??
         <String>[
-          if (widget.playlist.trackCount > 0)
-            '${widget.playlist.trackCount} 首',
+          if (widget.playlist.trackCount > 0) '${widget.playlist.trackCount} 首',
           if (widget.playlist.description.isNotEmpty)
             widget.playlist.description,
         ].join(' · ');
@@ -223,6 +226,7 @@ class LegacyTrackRow extends StatefulWidget {
     required this.onTap,
     this.current = false,
     this.playing = false,
+    this.onPlayFromHere,
   });
 
   final Track track;
@@ -231,12 +235,34 @@ class LegacyTrackRow extends StatefulWidget {
   final bool current;
   final bool playing;
 
+  /// Plays this row's whole list starting at this row.
+  ///
+  /// Supplying it turns on the row's context menu: every list that owns its
+  /// tracks can hand the menu a correct "play now", while rows used outside a
+  /// list stay menu-free.
+  final VoidCallback? onPlayFromHere;
+
   @override
   State<LegacyTrackRow> createState() => _LegacyTrackRowState();
 }
 
 class _LegacyTrackRowState extends State<LegacyTrackRow> {
   bool _hovering = false;
+
+  void _openMenu(Offset position) {
+    final AppState? state = InteractionFeedback.of(context);
+    final VoidCallback? play = widget.onPlayFromHere;
+    if (state == null || play == null) return;
+    unawaited(
+      showTrackContextMenu(
+        context: context,
+        state: state,
+        track: widget.track,
+        position: position,
+        onPlayNow: play,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -252,6 +278,13 @@ class _LegacyTrackRowState extends State<LegacyTrackRow> {
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: feedbackAction(context, widget.onTap),
+        onSecondaryTapDown: widget.onPlayFromHere == null
+            ? null
+            : (TapDownDetails details) => _openMenu(details.globalPosition),
+        onLongPressStart: widget.onPlayFromHere == null
+            ? null
+            : (LongPressStartDetails details) =>
+                  _openMenu(details.globalPosition),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 120),
           margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
@@ -280,7 +313,9 @@ class _LegacyTrackRowState extends State<LegacyTrackRow> {
                         '${widget.index + 1}',
                         textAlign: TextAlign.center,
                         style: theme.textTheme.labelMedium?.copyWith(
-                          color: _hovering ? apple.secondaryLabel : apple.tertiaryLabel,
+                          color: _hovering
+                              ? apple.secondaryLabel
+                              : apple.tertiaryLabel,
                           fontFeatures: const <FontFeature>[
                             FontFeature.tabularFigures(),
                           ],
@@ -307,7 +342,9 @@ class _LegacyTrackRowState extends State<LegacyTrackRow> {
                       overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.bodyMedium?.copyWith(
                         color: titleColor,
-                        fontWeight: widget.current ? FontWeight.w600 : FontWeight.w500,
+                        fontWeight: widget.current
+                            ? FontWeight.w600
+                            : FontWeight.w500,
                       ),
                     ),
                     if (translated != null && translated.isNotEmpty)

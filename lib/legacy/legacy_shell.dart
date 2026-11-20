@@ -1,9 +1,12 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../data/models.dart';
 import '../state/app_state.dart';
+import '../state/search_focus.dart';
 import '../state/song_comments_controller.dart';
 import '../state/detail_requests.dart';
 import '../state/ui_preferences.dart';
@@ -15,7 +18,9 @@ import '../widgets/interaction_feedback.dart';
 import '../widgets/song_comments_view.dart';
 import 'legacy_background.dart';
 import 'legacy_login.dart';
+import '../player/desktop_now_playing.dart';
 import '../player/now_playing_page.dart';
+import '../player/now_playing_requests.dart';
 import 'legacy_pages.dart';
 import 'legacy_player_bar.dart';
 import 'legacy_widgets.dart';
@@ -219,6 +224,105 @@ class _LegacyShellState extends State<LegacyShell>
     _nowPlayingMotion.reverse();
   }
 
+  // -- keyboard -------------------------------------------------------------
+
+  /// True while a text field owns the keyboard, so bare-letter and space
+  /// shortcuts never steal typing. Text fields keep the shortcuts that carry
+  /// Ctrl (Ctrl+F, Ctrl+arrows), which is what desktop apps do too.
+  bool get _typing {
+    final BuildContext? focusContext =
+        FocusManager.instance.primaryFocus?.context;
+    if (focusContext == null) return false;
+    return focusContext.widget is EditableText ||
+        focusContext.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
+  void _showNowPlaying({DesktopNowPlayingPane? pane}) {
+    if (pane != null) nowPlayingPaneRequest.value = pane;
+    _openNowPlaying();
+  }
+
+  Future<void> _toggleFullscreen() async {
+    try {
+      await windowManager.setFullScreen(!await windowManager.isFullScreen());
+    } catch (_) {
+      // Window chrome can refuse while a modal owns the window; nothing to do.
+    }
+  }
+
+  Future<void> _handleEscape() async {
+    try {
+      if (await windowManager.isFullScreen()) {
+        await windowManager.setFullScreen(false);
+        return;
+      }
+    } catch (_) {
+      // Same as above: falling back to closing a page is still useful.
+    }
+    if (!mounted) return;
+    if (_nowPlayingOpen) {
+      _closeNowPlaying();
+      return;
+    }
+    if (_hasDetail) _backToRoot();
+  }
+
+  bool get _hasDetail =>
+      _playlist != null ||
+      _album != null ||
+      _artist != null ||
+      _chart != null ||
+      _artistSongs ||
+      _artistReleases != null ||
+      _comments;
+
+  /// A cached feed plus a failed request is the one case where saying "you are
+  /// offline" helps; a first launch with nothing cached shows the home error
+  /// panel instead, so the banner never races the initial load.
+  bool get _showOffline => state.home != null && !state.online;
+
+  void _nudgeVolume(double delta) =>
+      unawaited(state.setVolume(state.volume + delta));
+
+  /// Global transport shortcuts. Registered once around the whole shell so they
+  /// work on every page, and skipped in text fields where the key means typing.
+  Map<ShortcutActivator, VoidCallback> get _shortcuts {
+    return <ShortcutActivator, VoidCallback>{
+      const SingleActivator(LogicalKeyboardKey.space): () {
+        if (!_typing) state.togglePlay();
+      },
+      const SingleActivator(LogicalKeyboardKey.arrowLeft, control: true):
+          state.previous,
+      const SingleActivator(LogicalKeyboardKey.arrowRight, control: true):
+          state.next,
+      const SingleActivator(LogicalKeyboardKey.arrowUp, control: true): () =>
+          _nudgeVolume(.05),
+      const SingleActivator(LogicalKeyboardKey.arrowDown, control: true): () =>
+          _nudgeVolume(-.05),
+      const SingleActivator(LogicalKeyboardKey.keyQ): () {
+        if (!_typing) _showNowPlaying(pane: DesktopNowPlayingPane.queue);
+      },
+      const SingleActivator(LogicalKeyboardKey.keyL): () {
+        if (!_typing) _showNowPlaying(pane: DesktopNowPlayingPane.lyrics);
+      },
+      const SingleActivator(LogicalKeyboardKey.keyF): () {
+        if (_typing) return;
+        _openNowPlaying();
+        unawaited(_toggleFullscreen());
+      },
+      const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
+        _select(_LegacySection.search);
+        requestSearchFocus();
+      },
+      const SingleActivator(LogicalKeyboardKey.keyM): () {
+        if (!_typing) unawaited(state.toggleMute());
+      },
+      const SingleActivator(LogicalKeyboardKey.escape): () {
+        unawaited(_handleEscape());
+      },
+    };
+  }
+
   // -- build ----------------------------------------------------------------
 
   @override
@@ -275,47 +379,55 @@ class _LegacyShellState extends State<LegacyShell>
               ],
             ),
           );
-          return Semantics(
-            key: const ValueKey<String>('app-semantics-root'),
-            container: true,
-            label: 'Lazer',
-            child: Stack(
-              fit: StackFit.expand,
-              children: <Widget>[
-                ExcludeSemantics(
-                  excluding: _nowPlayingOpen,
-                  child: ExcludeFocus(
-                    excluding: _nowPlayingOpen,
-                    child: TickerMode(
-                      enabled: !_nowPlayingOpen,
-                      child: RepaintBoundary(child: shell),
+          return CallbackShortcuts(
+            bindings: _shortcuts,
+            child: Focus(
+              autofocus: true,
+              child: Semantics(
+                key: const ValueKey<String>('app-semantics-root'),
+                container: true,
+                label: 'Lazer',
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: <Widget>[
+                    ExcludeSemantics(
+                      excluding: _nowPlayingOpen,
+                      child: ExcludeFocus(
+                        excluding: _nowPlayingOpen,
+                        child: TickerMode(
+                          enabled: !_nowPlayingOpen,
+                          child: RepaintBoundary(child: shell),
+                        ),
+                      ),
                     ),
-                  ),
-                ),
-                if (_nowPlayingOpen)
-                  Positioned.fill(
-                    child: SlideTransition(
-                      position: _nowPlayingSlide,
-                      child: Semantics(
-                        key: const ValueKey<String>('now-playing-semantics'),
-                        container: true,
-                        child: ExcludeSemantics(
-                          excluding: !_nowPlayingSettled,
-                          child: TickerMode(
-                            enabled: _nowPlayingSettled,
-                            child: RepaintBoundary(
-                              child: NowPlayingPage(
-                                state: state,
-                                onClose: _closeNowPlaying,
-                                entranceSettled: _nowPlayingSettled,
+                    if (_nowPlayingOpen)
+                      Positioned.fill(
+                        child: SlideTransition(
+                          position: _nowPlayingSlide,
+                          child: Semantics(
+                            key: const ValueKey<String>(
+                              'now-playing-semantics',
+                            ),
+                            container: true,
+                            child: ExcludeSemantics(
+                              excluding: !_nowPlayingSettled,
+                              child: TickerMode(
+                                enabled: _nowPlayingSettled,
+                                child: RepaintBoundary(
+                                  child: NowPlayingPage(
+                                    state: state,
+                                    onClose: _closeNowPlaying,
+                                    entranceSettled: _nowPlayingSettled,
+                                  ),
+                                ),
                               ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                  ),
-              ],
+                  ],
+                ),
+              ),
             ),
           );
         },
@@ -336,6 +448,7 @@ class _LegacyShellState extends State<LegacyShell>
                   children: <Widget>[
                     _desktopToolbar(apple),
                     Container(height: .5, color: apple.separator),
+                    if (_showOffline) _OfflineBanner(state: state),
                     Expanded(child: RepaintBoundary(child: _content())),
                   ],
                 ),
@@ -360,6 +473,7 @@ class _LegacyShellState extends State<LegacyShell>
     return Column(
       children: <Widget>[
         _mobileToolbar(apple),
+        if (_showOffline) _OfflineBanner(state: state),
         Expanded(child: RepaintBoundary(child: _content())),
         if (state.current != null)
           RepaintBoundary(
@@ -571,17 +685,7 @@ class _LegacyShellState extends State<LegacyShell>
               ),
               const SizedBox(width: 8),
             ],
-            Expanded(
-              child: Text(
-                _pageTitle,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  color: apple.label,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
+            Expanded(child: _toolbarTitleBlock(apple)),
           ],
         ),
       ),
@@ -606,17 +710,7 @@ class _LegacyShellState extends State<LegacyShell>
               const SizedBox(width: 10),
             ] else
               const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                _pageTitle,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  color: apple.label,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
+            Expanded(child: _toolbarTitleBlock(apple)),
             _ToolbarButton(
               tooltip: Theme.of(context).brightness == Brightness.dark
                   ? '浅色外观'
@@ -657,6 +751,56 @@ class _LegacyShellState extends State<LegacyShell>
       _LegacySection.likes => '我喜欢的音乐',
       _LegacySection.settings => '设置',
     };
+  }
+
+  /// Secondary line under the toolbar title. Root sections that used to repeat
+  /// their name in a page-sized heading now say it here instead, so the toolbar
+  /// is the single owner of the title. Detail pages keep the plain title.
+  String? get _pageSubtitle {
+    if (_comments || _chart != null || _playlist != null || _artist != null) {
+      return null;
+    }
+    return switch (_section) {
+      _LegacySection.library =>
+        state.isGuest ? '登录后同步你的歌单' : '${state.user.name} 的音乐',
+      _LegacySection.settings => '外观、界面和账户',
+      _ => null,
+    };
+  }
+
+  Widget _toolbarTitleBlock(AppleSemanticColors apple) {
+    final TextStyle titleStyle = Theme.of(context).textTheme.titleMedium!
+        .copyWith(color: apple.label, fontWeight: FontWeight.w700);
+    final String title = _pageTitle;
+    final String? subtitle = _pageSubtitle;
+    if (subtitle == null) {
+      return Text(
+        title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: titleStyle,
+      );
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: titleStyle,
+        ),
+        Text(
+          subtitle,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(
+            context,
+          ).textTheme.labelSmall?.copyWith(color: apple.secondaryLabel),
+        ),
+      ],
+    );
   }
 
   Widget _railPlaylists(AppleSemanticColors apple) {
@@ -1188,6 +1332,72 @@ class _RailPlaylistState extends State<_RailPlaylist> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// A slim strip that admits the app is showing cached content and offers the
+/// one action that helps: try again.
+class _OfflineBanner extends StatefulWidget {
+  const _OfflineBanner({required this.state});
+
+  final AppState state;
+
+  @override
+  State<_OfflineBanner> createState() => _OfflineBannerState();
+}
+
+class _OfflineBannerState extends State<_OfflineBanner> {
+  bool _retrying = false;
+
+  Future<void> _retry() async {
+    if (_retrying) return;
+    setState(() => _retrying = true);
+    try {
+      await widget.state.refreshHome(force: true);
+    } finally {
+      if (mounted) setState(() => _retrying = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final AppleSemanticColors apple = AppleSemanticColors.of(context);
+    return Container(
+      height: 34,
+      padding: const EdgeInsets.only(left: 16, right: 8),
+      color: apple.accentSoft,
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.wifi_off_rounded, size: 15, color: apple.accent),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '网络连接不上，显示的是缓存内容。',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: apple.secondaryLabel),
+            ),
+          ),
+          if (_retrying)
+            const SizedBox.square(
+              dimension: 14,
+              child: CircularProgressIndicator(strokeWidth: 1.6),
+            )
+          else
+            TextButton(
+              onPressed: _retry,
+              style: TextButton.styleFrom(
+                minimumSize: const Size(52, 28),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                foregroundColor: apple.accent,
+              ),
+              child: const Text('重试'),
+            ),
+        ],
       ),
     );
   }

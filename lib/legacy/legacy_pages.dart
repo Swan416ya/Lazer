@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, listEquals;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../data/catalog.dart';
 import '../data/catalog_details.dart';
@@ -18,7 +19,10 @@ import '../widgets/accessible_controls.dart';
 import '../widgets/apple_ui.dart';
 import '../widgets/catalog_links.dart';
 import '../widgets/interaction_feedback.dart';
+import '../widgets/track_context_menu.dart';
 import '../state/detail_requests.dart';
+import '../state/search_focus.dart';
+import '../state/search_history_store.dart';
 import '../widgets/ui_scaling.dart';
 import 'legacy_login.dart';
 import 'legacy_widgets.dart';
@@ -320,10 +324,14 @@ class _ArtistTrackCard extends StatefulWidget {
     required this.track,
     required this.current,
     required this.onTap,
+    this.onPlayFromHere,
   });
   final Track track;
   final bool current;
   final VoidCallback onTap;
+
+  /// Enables the shared track menu, including the ⋯ affordance on the right.
+  final VoidCallback? onPlayFromHere;
 
   @override
   State<_ArtistTrackCard> createState() => _ArtistTrackCardState();
@@ -331,6 +339,22 @@ class _ArtistTrackCard extends StatefulWidget {
 
 class _ArtistTrackCardState extends State<_ArtistTrackCard> {
   bool _hover = false;
+
+  void _openMenu(Offset position) {
+    final AppState? state = InteractionFeedback.of(context);
+    final VoidCallback? play = widget.onPlayFromHere;
+    if (state == null || play == null) return;
+    unawaited(
+      showTrackContextMenu(
+        context: context,
+        state: state,
+        track: widget.track,
+        position: position,
+        onPlayNow: play,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final AppleSemanticColors apple = AppleSemanticColors.of(context);
@@ -338,59 +362,85 @@ class _ArtistTrackCardState extends State<_ArtistTrackCard> {
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: feedbackAction(context, widget.onTap),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 120),
-            height: 66,
-            padding: const EdgeInsets.all(7),
-            decoration: BoxDecoration(
-              color: widget.current
-                  ? apple.accentSoft
-                  : _hover
-                  ? apple.fill
-                  : apple.secondaryGroupedBackground,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: apple.separator, width: .5),
-            ),
-            child: Row(
-              children: <Widget>[
-                LegacyCover(url: widget.track.coverUrl, size: 52, radius: 6),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        widget.track.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: widget.current ? apple.accent : apple.label,
-                          fontWeight: FontWeight.w600,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onSecondaryTapDown: widget.onPlayFromHere == null
+            ? null
+            : (TapDownDetails details) => _openMenu(details.globalPosition),
+        onLongPressStart: widget.onPlayFromHere == null
+            ? null
+            : (LongPressStartDetails details) =>
+                  _openMenu(details.globalPosition),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: feedbackAction(context, widget.onTap),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              height: 66,
+              padding: const EdgeInsets.all(7),
+              decoration: BoxDecoration(
+                color: widget.current
+                    ? apple.accentSoft
+                    : _hover
+                    ? apple.fill
+                    : apple.secondaryGroupedBackground,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: apple.separator, width: .5),
+              ),
+              child: Row(
+                children: <Widget>[
+                  LegacyCover(url: widget.track.coverUrl, size: 52, radius: 6),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          widget.track.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: widget.current
+                                    ? apple.accent
+                                    : apple.label,
+                                fontWeight: FontWeight.w600,
+                              ),
                         ),
-                      ),
-                      Text(
-                        <String>[
-                          widget.track.album,
-                          if (widget.track.duration > Duration.zero)
-                            legacyDuration(widget.track.duration),
-                        ].join(' \u00b7 '),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: apple.secondaryLabel,
+                        Text(
+                          <String>[
+                            widget.track.album,
+                            if (widget.track.duration > Duration.zero)
+                              legacyDuration(widget.track.duration),
+                          ].join(' \u00b7 '),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(color: apple.secondaryLabel),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-                Icon(Icons.more_horiz_rounded, color: apple.tertiaryLabel),
-              ],
+                  if (widget.onPlayFromHere == null)
+                    Icon(Icons.more_horiz_rounded, color: apple.tertiaryLabel)
+                  else
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: (TapDownDetails details) =>
+                          _openMenu(details.globalPosition),
+                      child: Padding(
+                        padding: const EdgeInsets.all(6),
+                        child: Icon(
+                          Icons.more_horiz_rounded,
+                          color: apple.tertiaryLabel,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
             ),
           ),
         ),
@@ -768,6 +818,8 @@ class _LegacyArtistSongsPageState extends State<LegacyArtistSongsPage> {
                         current: widget.state.current?.id == tracks[index].id,
                         playing: widget.state.playing,
                         onTap: () =>
+                            widget.state.playQueue(tracks, startIndex: index),
+                        onPlayFromHere: () =>
                             widget.state.playQueue(tracks, startIndex: index),
                       ),
                 ),
@@ -1478,6 +1530,7 @@ class _HomeTrackGrid extends StatelessWidget {
                     track: shown[column * rows + row],
                     current: state.current?.id == shown[column * rows + row].id,
                     onTap: () => onPlay(shown, column * rows + row),
+                    onPlayFromHere: () => onPlay(shown, column * rows + row),
                   ),
               ],
             ],
@@ -2217,6 +2270,18 @@ class _LegacyChartPageState extends State<LegacyChartPage> {
                               .where((entry) => entry.track != null)
                               .length,
                         ),
+                  onPlayFromHere: chart.entries[index].track == null
+                      ? null
+                      : () => widget.state.playQueue(
+                          chart.entries
+                              .map((entry) => entry.track)
+                              .whereType<Track>()
+                              .toList(),
+                          startIndex: chart.entries
+                              .take(index)
+                              .where((entry) => entry.track != null)
+                              .length,
+                        ),
                 ),
               ),
             ),
@@ -2477,10 +2542,30 @@ class _ChartTrackRow extends StatelessWidget {
     required this.entry,
     this.matching = false,
     this.onTap,
+    this.onPlayFromHere,
   });
   final ChartEntry entry;
   final bool matching;
   final VoidCallback? onTap;
+
+  /// Enables the shared track menu for rows whose song is already matched.
+  final VoidCallback? onPlayFromHere;
+
+  void _openMenu(BuildContext context, Offset position) {
+    final AppState? state = InteractionFeedback.of(context);
+    final Track? track = entry.track;
+    final VoidCallback? play = onPlayFromHere;
+    if (state == null || track == null || play == null) return;
+    unawaited(
+      showTrackContextMenu(
+        context: context,
+        state: state,
+        track: track,
+        position: position,
+        onPlayNow: play,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2497,105 +2582,119 @@ class _ChartTrackRow extends StatelessWidget {
       _ when previous != null => Icons.remove_rounded,
       _ => null,
     };
-    return ListTile(
-      minTileHeight: 68,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      tileColor: apple.secondaryGroupedBackground,
-      onTap: onTap == null ? null : feedbackAction(context, onTap!),
-      leading: SizedBox(
-        width: 84,
-        child: Row(
-          children: <Widget>[
-            SizedBox(
-              width: 38,
-              child: Text(
-                '${entry.rank}',
-                maxLines: 1,
-                softWrap: false,
-                overflow: TextOverflow.visible,
-                textAlign: TextAlign.right,
-                style: Theme.of(
-                  context,
-                ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
-              ),
-            ),
-            const SizedBox(width: 6),
-            LegacyCover(
-              url: entry.track?.coverUrl ?? entry.coverUrl,
-              size: 40,
-              radius: 6,
-            ),
-          ],
-        ),
-      ),
-      title: Text(
-        entry.title,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontWeight: FontWeight.w600),
-      ),
-      subtitle: Text(
-        <String>[
-          entry.artist.isNotEmpty ? entry.artist : entry.track?.artist ?? '',
-          if (entry.peakRank != null) '最高 #${entry.peakRank}',
-          if (entry.weeksOnChart != null) '${entry.weeksOnChart} 周',
-          if (!roomy && entry.score != null)
-            '${_formatChartScore(entry.score!)} 点',
-        ].where((value) => value.isNotEmpty).join(' · '),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-      ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          if (roomy && entry.score != null) ...<Widget>[
-            Text(
-              '${_formatChartScore(entry.score!)} 点',
-              style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                color: apple.secondaryLabel,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(width: 10),
-          ],
-          if (roomy && entry.trend.length > 1) ...<Widget>[
-            SizedBox(
-              width: 64,
-              height: 28,
-              child: CustomPaint(
-                painter: _ChartSparklinePainter(
-                  values: entry.trend,
-                  color: apple.accent,
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onSecondaryTapDown: onPlayFromHere == null
+          ? null
+          : (TapDownDetails details) =>
+                _openMenu(context, details.globalPosition),
+      onLongPressStart: onPlayFromHere == null
+          ? null
+          : (LongPressStartDetails details) =>
+                _openMenu(context, details.globalPosition),
+      child: ListTile(
+        minTileHeight: 68,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        tileColor: apple.secondaryGroupedBackground,
+        onTap: onTap == null ? null : feedbackAction(context, onTap!),
+        leading: SizedBox(
+          width: 84,
+          child: Row(
+            children: <Widget>[
+              SizedBox(
+                width: 38,
+                child: Text(
+                  '${entry.rank}',
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
+                  textAlign: TextAlign.right,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(width: 10),
-          ],
-          if (trend != null) Icon(trend, size: 16, color: apple.secondaryLabel),
-          if (entry.changeLabel != null) ...<Widget>[
-            if (trend != null) const SizedBox(width: 3),
-            Text(
-              entry.changeLabel!,
-              style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                color: apple.secondaryLabel,
-                fontWeight: FontWeight.w700,
+              const SizedBox(width: 6),
+              LegacyCover(
+                url: entry.track?.coverUrl ?? entry.coverUrl,
+                size: 40,
+                radius: 6,
               ),
-            ),
+            ],
+          ),
+        ),
+        title: Text(
+          entry.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        subtitle: Text(
+          <String>[
+            entry.artist.isNotEmpty ? entry.artist : entry.track?.artist ?? '',
+            if (entry.peakRank != null) '最高 #${entry.peakRank}',
+            if (entry.weeksOnChart != null) '${entry.weeksOnChart} 周',
+            if (!roomy && entry.score != null)
+              '${_formatChartScore(entry.score!)} 点',
+          ].where((value) => value.isNotEmpty).join(' · '),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            if (roomy && entry.score != null) ...<Widget>[
+              Text(
+                '${_formatChartScore(entry.score!)} 点',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: apple.secondaryLabel,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(width: 10),
+            ],
+            if (roomy && entry.trend.length > 1) ...<Widget>[
+              SizedBox(
+                width: 64,
+                height: 28,
+                child: CustomPaint(
+                  painter: _ChartSparklinePainter(
+                    values: entry.trend,
+                    color: apple.accent,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+            ],
+            if (trend != null)
+              Icon(trend, size: 16, color: apple.secondaryLabel),
+            if (entry.changeLabel != null) ...<Widget>[
+              if (trend != null) const SizedBox(width: 3),
+              Text(
+                entry.changeLabel!,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: apple.secondaryLabel,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+            if (trend != null || entry.changeLabel != null)
+              const SizedBox(width: 10),
+            if (matching)
+              const SizedBox.square(
+                dimension: 18,
+                child: CircularProgressIndicator(strokeWidth: 1.7),
+              )
+            else
+              Icon(
+                onTap == null
+                    ? Icons.link_off_rounded
+                    : Icons.play_arrow_rounded,
+                color: onTap == null ? apple.tertiaryLabel : apple.accent,
+              ),
           ],
-          if (trend != null || entry.changeLabel != null)
-            const SizedBox(width: 10),
-          if (matching)
-            const SizedBox.square(
-              dimension: 18,
-              child: CircularProgressIndicator(strokeWidth: 1.7),
-            )
-          else
-            Icon(
-              onTap == null ? Icons.link_off_rounded : Icons.play_arrow_rounded,
-              color: onTap == null ? apple.tertiaryLabel : apple.accent,
-            ),
-        ],
+        ),
       ),
     );
   }
@@ -2838,7 +2937,8 @@ class LegacyLibraryPage extends StatelessWidget {
     final List<Playlist> publicLists = _uniquePlaylists(
       state.home?.playlists ?? const <Playlist>[],
     );
-    if (mine.isEmpty && publicLists.isEmpty) {
+    final List<Track> recent = state.recentTracks;
+    if (mine.isEmpty && publicLists.isEmpty && recent.isEmpty) {
       return LegacyNotice(
         message: state.isGuest ? '登录后同步你的歌单' : '还没有歌单。',
         action: state.isGuest
@@ -2855,13 +2955,19 @@ class LegacyLibraryPage extends StatelessWidget {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 1180),
         child: ListView(
-          padding: EdgeInsets.fromLTRB(inset, 8, inset, 28),
+          padding: EdgeInsets.fromLTRB(inset, 16, inset, 28),
           children: <Widget>[
-            ApplePageTitle(
-              title: '资料库',
-              subtitle: state.isGuest ? '登录后同步你的歌单' : '${state.user.name} 的音乐',
-              padding: const EdgeInsets.fromLTRB(0, 12, 0, 18),
-            ),
+            if (recent.isNotEmpty) ...<Widget>[
+              const LegacySectionHeader(title: '最近播放'),
+              const SizedBox(height: 10),
+              _HomeTrackGrid(
+                state: state,
+                tracks: recent,
+                onPlay: (List<Track> tracks, int index) =>
+                    state.playQueue(tracks, startIndex: index),
+              ),
+              const SizedBox(height: 34),
+            ],
             if (mine.isNotEmpty) ...<Widget>[
               LegacySectionHeader(
                 title: '我的音乐',
@@ -3209,6 +3315,8 @@ class _LegacyPlaylistPageState extends State<LegacyPlaylistPage> {
                             playing: widget.state.playing,
                             onTap: () =>
                                 widget.state.playQueue(tracks, startIndex: i),
+                            onPlayFromHere: () =>
+                                widget.state.playQueue(tracks, startIndex: i),
                           ),
                     ),
                   ),
@@ -3434,6 +3542,8 @@ class LegacySearchPage extends StatefulWidget {
 
 class _LegacySearchPageState extends State<LegacySearchPage> {
   final TextEditingController _search = TextEditingController();
+  final FocusNode _searchFocus = FocusNode();
+  final SearchHistoryStore _history = SearchHistoryStore();
   Timer? _debounce;
   SearchResults? _results;
   _SearchTab _tab = _SearchTab.songs;
@@ -3442,30 +3552,239 @@ class _LegacySearchPageState extends State<LegacySearchPage> {
   String? _error;
   int _generation = 0;
 
+  // Recent / hot queries and the live suggestion panel.
+  List<String> _recentSearches = const <String>[];
+  List<String> _hotSearches = const <String>[];
+  List<_SearchSuggestion> _suggestions = const <_SearchSuggestion>[];
+  int _suggestionIndex = -1;
+  int _suggestGeneration = 0;
+  bool _suggestionsDismissed = false;
+  int _seenFocusRequest = 0;
+  bool _hotLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _seenFocusRequest = searchFocusRequest.value;
+    searchFocusRequest.addListener(_onSearchFocusRequest);
+    _searchFocus.addListener(_onSearchFocusChanged);
+    unawaited(_loadRecentSearches());
+    unawaited(_loadHotSearches());
+    // The shell bumps the request before this page mounts (Ctrl+F first
+    // navigates, then focuses); catch up once the field exists.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || searchFocusRequest.value == _seenFocusRequest) return;
+      _onSearchFocusRequest();
+    });
+  }
+
   @override
   void dispose() {
+    searchFocusRequest.removeListener(_onSearchFocusRequest);
+    _searchFocus.removeListener(_onSearchFocusChanged);
     _debounce?.cancel();
+    _searchFocus.dispose();
     _search.dispose();
     super.dispose();
   }
 
+  void _onSearchFocusRequest() {
+    if (!mounted) return;
+    _seenFocusRequest = searchFocusRequest.value;
+    _searchFocus.requestFocus();
+    final String text = _search.text;
+    _search.selection = TextSelection.collapsed(offset: text.length);
+  }
+
+  void _onSearchFocusChanged() {
+    if (_suggestionsDismissed || _suggestions.isEmpty || !mounted) return;
+    if (!_searchFocus.hasFocus) {
+      setState(() {
+        _suggestionsDismissed = true;
+        _suggestionIndex = -1;
+      });
+    }
+  }
+
+  Future<void> _loadRecentSearches() async {
+    try {
+      final List<String> entries = await _history.load();
+      if (!mounted) return;
+      setState(() => _recentSearches = entries);
+    } catch (_) {
+      // Local history is optional; an empty shelf is a fine fallback.
+    }
+  }
+
+  /// Hot words, falling back to the gateway's default keyword when the
+  /// hot-search endpoint answers with an empty list (it does for guests and
+  /// under risk control). Both failures are silent: the section just hides.
+  Future<void> _loadHotSearches() async {
+    if (_hotLoaded) return;
+    _hotLoaded = true;
+    List<String> hot = const <String>[];
+    try {
+      hot = await widget.state.gateway.hotSearches();
+    } catch (_) {
+      hot = const <String>[];
+    }
+    if (hot.isEmpty) {
+      try {
+        final Map<String, dynamic> body = await widget.state.gateway
+            .defaultSearchKeyword();
+        final Object? data = body['data'];
+        final Object? word = data is Map ? data['realkeyword'] : null;
+        if (word is String && word.trim().isNotEmpty) {
+          hot = <String>[word.trim()];
+        }
+      } catch (_) {
+        hot = const <String>[];
+      }
+    }
+    if (!mounted) return;
+    setState(
+      () =>
+          _hotSearches = hot.where((String e) => e.trim().isNotEmpty).toList(),
+    );
+  }
+
+  Future<void> _loadSuggestions(String query) async {
+    final int generation = ++_suggestGeneration;
+    if (query.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _suggestions = const <_SearchSuggestion>[];
+        _suggestionIndex = -1;
+      });
+      return;
+    }
+    try {
+      final Map<String, dynamic> body = await widget.state.gateway
+          .searchSuggestions(query);
+      if (!mounted || generation != _suggestGeneration) return;
+      setState(() {
+        _suggestions = _parseSearchSuggestions(body);
+        _suggestionIndex = -1;
+        _suggestionsDismissed = false;
+      });
+    } catch (_) {
+      if (!mounted || generation != _suggestGeneration) return;
+      setState(() {
+        _suggestions = const <_SearchSuggestion>[];
+        _suggestionIndex = -1;
+      });
+    }
+  }
+
+  Future<void> _rememberSearch(String query) async {
+    try {
+      final List<String> entries = await _history.record(query);
+      if (!mounted) return;
+      setState(() => _recentSearches = entries);
+    } catch (_) {
+      // Losing one recent query is not worth interrupting the search.
+    }
+  }
+
+  Future<void> _removeRecentSearch(String query) async {
+    try {
+      final List<String> entries = await _history.remove(query);
+      if (!mounted) return;
+      setState(() => _recentSearches = entries);
+    } catch (_) {}
+  }
+
+  Future<void> _clearRecentSearches() async {
+    try {
+      await _history.clear();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() => _recentSearches = const <String>[]);
+  }
+
+  /// Runs [query] for real (Enter, a suggestion, a hot chip or a recent
+  /// entry): fills the field, hides the panel and starts the search.
+  void _submitQuery(String value) {
+    final String query = value.trim();
+    if (query.isEmpty) {
+      _clear();
+      return;
+    }
+    _debounce?.cancel();
+    _search.text = query;
+    _search.selection = TextSelection.collapsed(offset: query.length);
+    _suggestGeneration++;
+    setState(() {
+      _suggestions = const <_SearchSuggestion>[];
+      _suggestionIndex = -1;
+      _suggestionsDismissed = true;
+    });
+    _searchFocus.requestFocus();
+    unawaited(_run(query));
+  }
+
+  KeyEventResult _onSearchKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is KeyUpEvent) return KeyEventResult.ignored;
+    if (_suggestions.isEmpty || _suggestionsDismissed) {
+      return KeyEventResult.ignored;
+    }
+    final LogicalKeyboardKey key = event.logicalKey;
+    if (key == LogicalKeyboardKey.arrowDown) {
+      setState(
+        () => _suggestionIndex = (_suggestionIndex + 1) % _suggestions.length,
+      );
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) {
+      setState(() {
+        _suggestionIndex = _suggestionIndex <= 0
+            ? _suggestions.length - 1
+            : _suggestionIndex - 1;
+      });
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.escape) {
+      setState(() {
+        _suggestionsDismissed = true;
+        _suggestionIndex = -1;
+      });
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   void _onChanged(String value) {
     _debounce?.cancel();
+    _suggestGeneration++;
+    _suggestionsDismissed = false;
+    _suggestionIndex = -1;
+    if (value.trim().isEmpty) {
+      setState(() => _suggestions = const <_SearchSuggestion>[]);
+    } else {
+      // Rebuild right away for the clear affordance; the query stays debounced.
+      setState(() {});
+    }
     _debounce = Timer(const Duration(milliseconds: 350), () {
       if (!mounted) return;
+      // The results and the suggestion list travel together: both wait for the
+      // same pause so a fast typist pays one round trip per settled query.
       unawaited(_run(value.trim()));
+      unawaited(_loadSuggestions(value.trim()));
     });
-    // Rebuild right away for the clear affordance; the query stays debounced.
-    setState(() {});
   }
 
   void _clear() {
     _debounce?.cancel();
     _search.clear();
     _generation++;
+    _suggestGeneration++;
+    _searchFocus.requestFocus();
     setState(() {
       _query = '';
       _results = null;
+      _suggestions = const <_SearchSuggestion>[];
+      _suggestionIndex = -1;
+      _suggestionsDismissed = true;
       _loading = false;
       _error = null;
     });
@@ -3492,8 +3811,11 @@ class _LegacySearchPageState extends State<LegacySearchPage> {
       if (!mounted || generation != _generation) return;
       setState(() {
         _results = results;
+        _query = query;
         _loading = false;
       });
+      // Only a search that actually ran to completion earns a history entry.
+      unawaited(_rememberSearch(query));
     } catch (_) {
       if (!mounted || generation != _generation) return;
       setState(() {
@@ -3502,6 +3824,9 @@ class _LegacySearchPageState extends State<LegacySearchPage> {
       });
     }
   }
+
+  bool get _suggestionsVisible =>
+      _suggestions.isNotEmpty && !_suggestionsDismissed && _query.isNotEmpty;
 
   @override
   Widget build(BuildContext context) {
@@ -3514,17 +3839,129 @@ class _LegacySearchPageState extends State<LegacySearchPage> {
           children: <Widget>[
             Padding(
               padding: EdgeInsets.fromLTRB(inset, 14, inset, 12),
-              child: AppleSearchField(
-                controller: _search,
-                autofocus: true,
-                onChanged: _onChanged,
-                onClear: _clear,
+              child: Focus(
+                canRequestFocus: false,
+                skipTraversal: true,
+                onKeyEvent: _onSearchKeyEvent,
+                child: _SearchField(
+                  controller: _search,
+                  focusNode: _searchFocus,
+                  autofocus: true,
+                  onChanged: _onChanged,
+                  onClear: _clear,
+                  onSubmitted: (_) => _submitQuery(
+                    _suggestionIndex >= 0 &&
+                            _suggestionIndex < _suggestions.length
+                        ? _suggestions[_suggestionIndex].query
+                        : _search.text,
+                  ),
+                ),
               ),
             ),
-            Expanded(child: _body(inset)),
+            Expanded(
+              child: Stack(
+                children: <Widget>[
+                  Positioned.fill(child: _body(inset)),
+                  if (_suggestionsVisible)
+                    Positioned(
+                      top: 0,
+                      left: inset,
+                      right: inset,
+                      child: _SearchSuggestionPanel(
+                        suggestions: _suggestions,
+                        activeIndex: _suggestionIndex,
+                        onSelect: (int index) =>
+                            _submitQuery(_suggestions[index].query),
+                      ),
+                    ),
+                ],
+              ),
+            ),
           ],
         ),
       ),
+    );
+  }
+
+  /// The idle page: recent queries on top, then hot chips. When neither source
+  /// has an answer (fresh install, guest session, offline) it falls back to the
+  /// original single-line hint rather than showing two empty headings.
+  Widget _emptyBody(double inset) {
+    final AppleSemanticColors apple = AppleSemanticColors.of(context);
+    if (_recentSearches.isEmpty && _hotSearches.isEmpty) {
+      return const LegacyNotice(
+        message: '搜索歌曲、歌手或歌单。',
+        icon: Icons.search_rounded,
+      );
+    }
+    return ListView(
+      padding: EdgeInsets.fromLTRB(inset, 2, inset, 28),
+      children: <Widget>[
+        if (_recentSearches.isNotEmpty) ...<Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(2, 6, 2, 4),
+            child: LegacySectionHeader(
+              title: '最近搜索',
+              trailing: TextButton(
+                onPressed: () => unawaited(_clearRecentSearches()),
+                child: const Text('清空'),
+              ),
+            ),
+          ),
+          for (final String entry in _recentSearches)
+            AppleListTile(
+              title: entry,
+              minHeight: 42,
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+              leading: Icon(
+                Icons.history_rounded,
+                size: 18,
+                color: apple.secondaryLabel,
+              ),
+              trailing: Tooltip(
+                message: '删除',
+                child: InkResponse(
+                  onTap: () => unawaited(_removeRecentSearch(entry)),
+                  radius: 14,
+                  child: Padding(
+                    padding: const EdgeInsets.all(4),
+                    child: Icon(
+                      Icons.close_rounded,
+                      size: 16,
+                      color: apple.tertiaryLabel,
+                    ),
+                  ),
+                ),
+              ),
+              onTap: () => _submitQuery(entry),
+            ),
+        ],
+        if (_hotSearches.isNotEmpty) ...<Widget>[
+          Padding(
+            padding: EdgeInsets.fromLTRB(
+              2,
+              _recentSearches.isEmpty ? 6 : 16,
+              2,
+              6,
+            ),
+            child: const LegacySectionHeader(title: '热门搜索'),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(2, 2, 2, 0),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: <Widget>[
+                for (final String keyword in _hotSearches)
+                  _SearchKeywordChip(
+                    label: keyword,
+                    onTap: () => _submitQuery(keyword),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -3544,10 +3981,7 @@ class _LegacySearchPageState extends State<LegacySearchPage> {
     }
     final SearchResults? results = _results;
     if (_query.isEmpty) {
-      return const LegacyNotice(
-        message: '搜索歌曲、歌手或歌单。',
-        icon: Icons.search_rounded,
-      );
+      return _emptyBody(inset);
     }
     if (results == null || results.hits == 0) {
       return const LegacyNotice(
@@ -3600,6 +4034,8 @@ class _LegacySearchPageState extends State<LegacySearchPage> {
                     current: widget.state.current?.id == results.tracks[i].id,
                     playing: widget.state.playing,
                     onTap: () =>
+                        widget.state.playQueue(results.tracks, startIndex: i),
+                    onPlayFromHere: () =>
                         widget.state.playQueue(results.tracks, startIndex: i),
                   ),
               ],
@@ -3725,13 +4161,8 @@ class LegacySettingsPage extends StatelessWidget {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 760),
         child: ListView(
-          padding: EdgeInsets.fromLTRB(inset, 8, inset, 36),
+          padding: EdgeInsets.fromLTRB(inset, 12, inset, 36),
           children: <Widget>[
-            const ApplePageTitle(
-              title: '设置',
-              subtitle: '外观、界面和账户。',
-              padding: EdgeInsets.fromLTRB(0, 12, 0, 20),
-            ),
             const _LegacySectionLabel('界面'),
             AppleGroupedCard(
               margin: EdgeInsets.zero,
@@ -4497,4 +4928,294 @@ List<Playlist> _uniquePlaylists(List<Playlist> input) {
     for (final Playlist playlist in input)
       if (seen.add(playlist.id)) playlist,
   ];
+}
+
+/// Kind of autocomplete entry; only drives the row's glyph and trailing label.
+enum _SuggestionKind { song, artist, album, playlist }
+
+/// One keyboard-selectable autocomplete row. [label] is what the panel shows;
+/// [query] is what lands in the field and gets searched. Song rows show the
+/// artist too, but filling `title · artist` would narrow the search away.
+class _SearchSuggestion {
+  const _SearchSuggestion({
+    required this.query,
+    required this.label,
+    required this.kind,
+  });
+
+  final String query;
+  final String label;
+  final _SuggestionKind kind;
+
+  IconData get icon => switch (kind) {
+    _SuggestionKind.song => Icons.music_note_rounded,
+    _SuggestionKind.artist => Icons.person_rounded,
+    _SuggestionKind.album => Icons.album_rounded,
+    _SuggestionKind.playlist => Icons.queue_music_rounded,
+  };
+
+  String get kindLabel => switch (kind) {
+    _SuggestionKind.song => '歌曲',
+    _SuggestionKind.artist => '歌手',
+    _SuggestionKind.album => '专辑',
+    _SuggestionKind.playlist => '歌单',
+  };
+}
+
+String _firstArtistName(Object? artists) {
+  if (artists is! List) return '';
+  for (final Object? item in artists) {
+    if (item is Map) {
+      final String name = item['name']?.toString() ?? '';
+      if (name.trim().isNotEmpty) return name.trim();
+    }
+  }
+  return '';
+}
+
+String _suggestionArtistName(Object? artist) {
+  if (artist is Map) return (artist['name']?.toString() ?? '').trim();
+  return '';
+}
+
+String _suggestionLabel(String name, String secondary) {
+  final String extra = secondary.trim();
+  return extra.isEmpty ? name : '$name · $extra';
+}
+
+/// Flattens `/search/suggest` into at most eight rows.
+///
+/// The endpoint answers with four typed lists and an `order` array rather than
+/// a pre-flattened `allMatch`, so the order comes from `order` when present and
+/// falls back to Apple's own ranking (songs, artists, albums, playlists).
+List<_SearchSuggestion> _parseSearchSuggestions(Map<String, dynamic> body) {
+  final Object? result = body['result'];
+  if (result is! Map) return const <_SearchSuggestion>[];
+  final List<_SearchSuggestion> entries = <_SearchSuggestion>[];
+
+  void add(String query, String label, _SuggestionKind kind) {
+    final String trimmedQuery = query.trim();
+    if (trimmedQuery.isEmpty) return;
+    if (entries.any((_SearchSuggestion entry) => entry.query == trimmedQuery)) {
+      return;
+    }
+    entries.add(
+      _SearchSuggestion(
+        query: trimmedQuery,
+        label: label.trim().isEmpty ? trimmedQuery : label.trim(),
+        kind: kind,
+      ),
+    );
+  }
+
+  final Object? order = result['order'];
+  final List<String> blocks = order is List
+      ? order.whereType<String>().toList(growable: false)
+      : const <String>['songs', 'artists', 'albums', 'playlists'];
+
+  for (final String block in blocks) {
+    final Object? rows = result[block];
+    if (rows is! List) continue;
+    for (final Object? raw in rows) {
+      if (raw is! Map) continue;
+      final String name = raw['name']?.toString() ?? '';
+      if (name.trim().isEmpty) continue;
+      if (block == 'songs') {
+        add(
+          name,
+          _suggestionLabel(name, _firstArtistName(raw['artists'])),
+          _SuggestionKind.song,
+        );
+      } else if (block == 'artists') {
+        add(name, name, _SuggestionKind.artist);
+      } else if (block == 'albums') {
+        add(
+          name,
+          _suggestionLabel(name, _suggestionArtistName(raw['artist'])),
+          _SuggestionKind.album,
+        );
+      } else if (block == 'playlists') {
+        add(name, name, _SuggestionKind.playlist);
+      }
+    }
+  }
+  return entries.take(8).toList(growable: false);
+}
+
+/// Search field for the search page.
+///
+/// Mirrors [AppleSearchField]'s look (same transparent SearchBar, 12 px corners,
+/// 56 px height) but adds the two seams the page needs: the [focusNode] that
+/// `Ctrl+F` focuses and the [onSubmitted] callback that turns Enter into a
+/// search. Kept local so the shared widget keeps its simpler contract.
+class _SearchField extends StatelessWidget {
+  const _SearchField({
+    required this.controller,
+    required this.focusNode,
+    required this.onChanged,
+    required this.onSubmitted,
+    this.onClear,
+    this.autofocus = false,
+  });
+
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final ValueChanged<String> onChanged;
+  final ValueChanged<String> onSubmitted;
+  final VoidCallback? onClear;
+  final bool autofocus;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 56,
+      child: SearchBar(
+        controller: controller,
+        focusNode: focusNode,
+        onChanged: onChanged,
+        onSubmitted: onSubmitted,
+        hintText: '搜索歌曲、歌手或歌单',
+        autoFocus: autofocus,
+        elevation: const WidgetStatePropertyAll<double>(0),
+        shadowColor: const WidgetStatePropertyAll<Color>(Colors.transparent),
+        surfaceTintColor: const WidgetStatePropertyAll<Color>(
+          Colors.transparent,
+        ),
+        overlayColor: const WidgetStatePropertyAll<Color>(Colors.transparent),
+        textInputAction: TextInputAction.search,
+        leading: const Icon(Icons.search),
+        shape: const WidgetStatePropertyAll<OutlinedBorder>(
+          RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(12)),
+          ),
+        ),
+        trailing: <Widget>[
+          if (controller.text.isNotEmpty)
+            IconButton(
+              tooltip: '清除',
+              onPressed: onClear,
+              icon: const Icon(Icons.close),
+            ),
+        ],
+        constraints: BoxConstraints(
+          minWidth: 0,
+          maxWidth: double.infinity,
+          minHeight: 56,
+          maxHeight: 56,
+        ),
+      ),
+    );
+  }
+}
+
+/// Lightweight overlay under the search field, in the spirit of Apple Music's
+/// inline search suggestions: no barrier, rows highlight on hover or with the
+/// arrow keys, and the panel closes on Escape or a click elsewhere.
+class _SearchSuggestionPanel extends StatelessWidget {
+  const _SearchSuggestionPanel({
+    required this.suggestions,
+    required this.activeIndex,
+    required this.onSelect,
+  });
+
+  final List<_SearchSuggestion> suggestions;
+  final int activeIndex;
+  final ValueChanged<int> onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final AppleSemanticColors apple = AppleSemanticColors.of(context);
+    return Material(
+      color: apple.secondaryGroupedBackground,
+      elevation: 8,
+      shadowColor: Colors.black.withValues(alpha: .18),
+      borderRadius: BorderRadius.circular(12),
+      clipBehavior: Clip.antiAlias,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 320),
+        child: ListView.builder(
+          shrinkWrap: true,
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          itemCount: suggestions.length,
+          itemBuilder: (BuildContext context, int index) {
+            final _SearchSuggestion suggestion = suggestions[index];
+            final bool active = index == activeIndex;
+            return InkWell(
+              canRequestFocus: false,
+              onTap: () => onSelect(index),
+              highlightColor: apple.fill,
+              child: ColoredBox(
+                color: active ? apple.fill : Colors.transparent,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 9,
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(
+                        suggestion.icon,
+                        size: 16,
+                        color: apple.secondaryLabel,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          suggestion.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: apple.label,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        suggestion.kindLabel,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: apple.tertiaryLabel,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+/// A hot-search word. A low chip rather than a list row: hot words are cheap to
+/// scan and the empty page already has a list above them.
+class _SearchKeywordChip extends StatelessWidget {
+  const _SearchKeywordChip({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final AppleSemanticColors apple = AppleSemanticColors.of(context);
+    return Material(
+      color: apple.fill,
+      borderRadius: BorderRadius.circular(12),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        highlightColor: apple.label.withValues(alpha: .06),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          child: Text(
+            label,
+            style: theme.textTheme.bodyMedium?.copyWith(color: apple.label),
+          ),
+        ),
+      ),
+    );
+  }
 }

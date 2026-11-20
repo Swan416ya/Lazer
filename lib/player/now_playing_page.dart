@@ -24,6 +24,7 @@ import '../widgets/playback_queue_view.dart';
 import '../widgets/player_seek_bar.dart';
 import '../widgets/song_comments_view.dart';
 import 'desktop_now_playing.dart';
+import 'now_playing_requests.dart';
 
 /// Shared comments entry from the player header.
 Future<void> showSongComments(
@@ -188,6 +189,8 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
     super.initState();
     _commentsController = SongCommentsController(widget.state.gateway);
     widget.state.addListener(_preferencesChanged);
+    nowPlayingPaneRequest.addListener(_onPaneRequest);
+    _consumePaneRequest();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) unawaited(widget.state.ensureCurrentLyrics());
     });
@@ -274,6 +277,7 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
   void dispose() {
     _hideTimer?.cancel();
     widget.state.removeListener(_preferencesChanged);
+    nowPlayingPaneRequest.removeListener(_onPaneRequest);
     _commentsController.dispose();
     super.dispose();
   }
@@ -350,6 +354,22 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
       _controlsVisible = true;
     });
     _armHide();
+  }
+
+  /// Reads the pending pane request without calling [setState]; used from
+  /// [initState], where the pane field can be assigned directly.
+  void _consumePaneRequest() {
+    final DesktopNowPlayingPane? pane = nowPlayingPaneRequest.value;
+    if (pane == null) return;
+    nowPlayingPaneRequest.value = null;
+    _desktopPane = pane;
+  }
+
+  void _onPaneRequest() {
+    final DesktopNowPlayingPane? pane = nowPlayingPaneRequest.value;
+    if (pane == null || !mounted) return;
+    nowPlayingPaneRequest.value = null;
+    _selectDesktopPane(pane);
   }
 
   @override
