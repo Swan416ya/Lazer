@@ -133,7 +133,13 @@ class NeteaseTransport {
     io.HttpClient? client,
     DateTime Function()? clock,
   }) : _client =
-           client ?? (io.HttpClient()..connectionTimeout = requestTimeout),
+           client ??
+           (io.HttpClient()
+             // Decodes a gzip body (the client asks for one by default) before
+             // the caller reads it, so the JSON text is materialised once.
+             // Never turn this off here: `utf8.decoder` would then see gzip.
+             ..autoUncompress = true
+             ..connectionTimeout = requestTimeout),
        _clock = clock ?? DateTime.now;
 
   final String userAgent;
@@ -370,6 +376,7 @@ class NeteaseTransport {
         .postUrl(Uri.parse('$endpoint$requestPath'))
         .timeout(requestTimeout);
     request.headers.set(io.HttpHeaders.acceptHeader, 'application/json');
+    _acceptGzip(request);
     request.headers.set(
       io.HttpHeaders.userAgentHeader,
       plain ? _desktopUserAgent : userAgent,
@@ -448,6 +455,7 @@ class NeteaseTransport {
     );
     final request = await _client.getUrl(uri).timeout(requestTimeout);
     request.headers.set(io.HttpHeaders.acceptHeader, 'application/json');
+    _acceptGzip(request);
     request.headers.set(io.HttpHeaders.userAgentHeader, userAgent);
     request.headers.set('Referer', 'https://music.163.com/');
     if (cookie != null) {
@@ -464,6 +472,7 @@ class NeteaseTransport {
     final Uri uri = Uri.https('music.163.com', route.path);
     final request = await _client.postUrl(uri).timeout(requestTimeout);
     request.headers.set(io.HttpHeaders.acceptHeader, 'application/json');
+    _acceptGzip(request);
     request.headers.set(io.HttpHeaders.userAgentHeader, userAgent);
     request.headers.set('Referer', 'https://music.163.com/');
     request.headers.contentType = io.ContentType(
@@ -502,6 +511,17 @@ class NeteaseTransport {
       throw GatewayProtocolException(alias);
     }
   }
+
+  /// States the compression contract at each call site. dart:io already adds
+  /// `Accept-Encoding: gzip` to every request it opens (http_impl.dart builds
+  /// the request with it), so this changes nothing on the wire today; it keeps
+  /// the contract visible next to the request we build and keeps it true if the
+  /// client default ever moves. What actually decodes the body is
+  /// `autoUncompress` on `_client` — a thousand-song `song/detail` is megabytes
+  /// of JSON, and inflating it here before `utf8.decoder` still yields one copy
+  /// of the text, not two.
+  static void _acceptGzip(io.HttpClientRequest request) =>
+      request.headers.set(io.HttpHeaders.acceptEncodingHeader, 'gzip');
 
   static Map<String, dynamic> _normalizeFields(Map<String, dynamic> element) {
     return element.map((String key, dynamic value) {

@@ -23,6 +23,15 @@ class DiskCache {
   final Map<CacheBucket, int> limits;
   Future<Directory?>? _root;
   final _writes = <String, Future<File?>>{};
+  // What is on disk, per bucket: size plus the LRU stamp. Pruning walks these
+  // records instead of the directory, so evicting one file costs one unlink
+  // rather than one `stat` for every file in the bucket. That is what keeps a
+  // write proportional to the entries it drops, not to the cache size.
+  final _entries = <CacheBucket, Map<String, _CacheEntry>>{};
+  final _totals = <CacheBucket, int>{};
+  // Folding an older session's files into `_entries` needs one directory
+  // listing, so it runs at most once per bucket per process, in the background.
+  final _scans = <CacheBucket, Future<void>>{};
   final _maintenance = <CacheBucket, Future<void>>{};
   int _serial = 0;
 
@@ -56,10 +65,17 @@ class DiskCache {
   }) async {
     try {
       final file = await _path(bucket, key, extension);
-      if (file == null || !await file.exists() || await file.length() == 0) {
+      if (file == null) return null;
+      if (!await file.exists() || await file.length() == 0) {
+        // The record outlived the file (manual cleanup, crashed session): drop
+        // it so the bucket's running total stays honest.
+        _forget(bucket, file.path);
         return null;
       }
       await file.setLastModified(DateTime.now());
+      // Pre-existing files are folded in by the background scan, which reads
+      // the timestamp written just above; session writes are already recorded.
+      _entries[bucket]?[_nameOf(file.path)]?.modified = DateTime.now();
       return file;
     } catch (_) {
       return null;
@@ -73,7 +89,9 @@ class DiskCache {
   }) async {
     try {
       final file = await _path(bucket, key, extension);
-      if (file != null && await file.exists()) await file.delete();
+      if (file == null) return;
+      if (await file.exists()) await file.delete();
+      _forget(bucket, file.path);
     } catch (_) {}
   }
 
@@ -148,11 +166,19 @@ class DiskCache {
       }
       await partial.rename(target.path);
       partial = null;
-      // Serialize pruning so concurrent cover downloads share one LRU pass.
-      final previous = _maintenance[bucket] ?? Future<void>.value();
-      final next = previous.then((_) => _prune(bucket, target.path));
-      _maintenance[bucket] = next;
-      await next;
+      // Record first, then evict. Both steps only walk the in-memory records,
+      // so the cost of a write is the number of entries it drops rather than
+      // the number of files the bucket holds — and that stays true once the
+      // bucket is full, which is the state the old scan ran in all the time.
+      final int total = _remember(bucket, target, length);
+      unawaited(_scan(bucket));
+      if (total > (limits[bucket] ?? 0)) {
+        try {
+          await _prune(bucket, _nameOf(target.path));
+        } catch (_) {
+          // A failed eviction must never discard the file just written.
+        }
+      }
       return target;
     } catch (_) {
       return null;
@@ -166,36 +192,106 @@ class DiskCache {
     }
   }
 
-  Future<void> _prune(CacheBucket bucket, String keep) async {
+  /// Records a freshly written file and returns the bucket total.
+  int _remember(CacheBucket bucket, File target, int size) {
+    final entries = _entries.putIfAbsent(bucket, () => <String, _CacheEntry>{});
+    final String name = _nameOf(target.path);
+    final int replaced = entries[name]?.size ?? 0;
+    entries[name] = _CacheEntry(target.path, size, DateTime.now());
+    final int total = (_totals[bucket] ?? 0) - replaced + size;
+    return _totals[bucket] = total < 0 ? 0 : total;
+  }
+
+  void _forget(CacheBucket bucket, String path) {
+    final entry = _entries[bucket]?.remove(_nameOf(path));
+    if (entry == null) return;
+    final int total = (_totals[bucket] ?? 0) - entry.size;
+    _totals[bucket] = total < 0 ? 0 : total;
+  }
+
+  /// Files are keyed by name: `Directory.list()` and the path a write built can
+  /// disagree on separators, and two spellings of the same file would be
+  /// counted twice and evicted as two entries.
+  static String _nameOf(String path) {
+    final int cut = path.lastIndexOf(RegExp(r'[\\/]'));
+    return (cut < 0 ? path : path.substring(cut + 1)).toLowerCase();
+  }
+
+  /// Folds files left by an earlier session into the records: one directory
+  /// listing per bucket per process, never on a write's critical path.
+  Future<void> _scan(CacheBucket bucket) =>
+      _scans[bucket] ??= _scanBucket(bucket);
+
+  Future<void> _scanBucket(CacheBucket bucket) async {
     try {
       final root = await _open();
       if (root == null) return;
-      final files = <(File, FileStat)>[];
-      var total = 0;
-      await for (final entry in Directory(
+      final entries = _entries.putIfAbsent(
+        bucket,
+        () => <String, _CacheEntry>{},
+      );
+      _totals.putIfAbsent(bucket, () => 0);
+      await for (final entity in Directory(
         '${root.path}/${bucket.name}',
       ).list()) {
-        if (entry is! File) continue;
-        final stat = await entry.stat();
-        if (entry.path.endsWith('.part')) {
+        if (entity is! File) continue;
+        final stat = await entity.stat();
+        if (entity.path.endsWith('.part')) {
           if (DateTime.now().difference(stat.modified) >
               const Duration(days: 1)) {
-            await entry.delete();
+            await entity.delete();
           }
           continue;
         }
-        files.add((entry, stat));
-        total += stat.size;
+        final String name = _nameOf(entity.path);
+        // Already recorded by a write from this session, and already counted.
+        if (entries.containsKey(name)) continue;
+        entries[name] = _CacheEntry(entity.path, stat.size, stat.modified);
+        _totals[bucket] = (_totals[bucket] ?? 0) + stat.size;
       }
-      files.sort((a, b) => a.$2.modified.compareTo(b.$2.modified));
-      for (final (file, stat) in files) {
-        if (total <= (limits[bucket] ?? 0)) break;
-        if (file.path == keep) continue;
+      if ((_totals[bucket] ?? 0) > (limits[bucket] ?? 0)) {
+        await _prune(bucket, '');
+      }
+    } catch (_) {}
+  }
+
+  /// Serializes eviction per bucket so overlapping writes cannot race on the
+  /// same records, then drops the least recently used entries until the bucket
+  /// fits its budget again. [keepName] is the entry just written, never evicted.
+  Future<void> _prune(CacheBucket bucket, String keep) {
+    final previous = _maintenance[bucket] ?? Future<void>.value();
+    final next = previous.then((_) => _pruneNow(bucket, keep));
+    _maintenance[bucket] = next;
+    return next;
+  }
+
+  Future<void> _pruneNow(CacheBucket bucket, String keep) async {
+    try {
+      final entries = _entries[bucket];
+      final int limit = limits[bucket] ?? 0;
+      if (entries == null || entries.isEmpty || limit <= 0) return;
+      int total = _totals[bucket] ?? 0;
+      if (total <= limit) return;
+      // Trim with headroom. A bucket trimmed back to exactly its limit is over
+      // budget again on the very next write, and a full bucket — the normal
+      // state of the artwork bucket — would then sort its records on every
+      // download. Clearing ~10% costs one or two extra files per pass and buys
+      // ~10 writes that walk nothing.
+      final int trimTo = limit - limit ~/ 10;
+      final candidates = <MapEntry<String, _CacheEntry>>[
+        for (final entry in entries.entries)
+          if (entry.key != keep) entry,
+      ]..sort((a, b) => a.value.modified.compareTo(b.value.modified));
+      for (final MapEntry<String, _CacheEntry> candidate in candidates) {
+        if (total <= trimTo) break;
         try {
-          await file.delete();
-          total -= stat.size;
+          final file = File(candidate.value.path);
+          if (await file.exists()) await file.delete();
         } catch (_) {}
+        entries.remove(candidate.key);
+        total -= candidate.value.size;
       }
+      _totals[bucket] = total < 0 ? 0 : total;
     } catch (_) {}
   }
 
@@ -252,4 +348,13 @@ class CachedJson {
   final Map<String, dynamic> data;
   final DateTime savedAt;
   bool fresh(Duration ttl) => DateTime.now().difference(savedAt) < ttl;
+}
+
+/// One file on disk as the cache remembers it: where it lives, how much it
+/// costs the bucket budget and how recently it was used.
+class _CacheEntry {
+  _CacheEntry(this.path, this.size, this.modified);
+  final String path;
+  final int size;
+  DateTime modified;
 }

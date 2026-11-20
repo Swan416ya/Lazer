@@ -9,13 +9,37 @@ import 'disk_cache.dart';
 
 /// One persistent cover store shared by widgets, system controls and export.
 class ArtworkCache {
-  ArtworkCache({DiskCache? disk, List<String> Function(String)? candidates})
-    : disk = disk ?? DiskCache.shared,
-      _candidates = candidates ?? artworkCandidates;
+  ArtworkCache({
+    DiskCache? disk,
+    List<String> Function(String)? candidates,
+    HttpClient? client,
+  }) : disk = disk ?? DiskCache.shared,
+       _candidates = candidates ?? artworkCandidates,
+       _client = client ?? _pooledClient(),
+       _ownsClient = client == null;
+
+  /// Covers all come from the same few CDN hosts, so one client keeps the TLS
+  /// sessions alive across the 20+ images a page asks for. The hosts are also
+  /// asked for several renditions at once: capping the pool makes them queue
+  /// on warm connections instead of opening one cold handshake per image.
+  static HttpClient _pooledClient() => HttpClient()
+    ..autoUncompress = false
+    ..connectionTimeout = const Duration(seconds: 8)
+    ..idleTimeout = const Duration(seconds: 20)
+    ..maxConnectionsPerHost = 8;
+
   static final shared = ArtworkCache();
   final DiskCache disk;
   final List<String> Function(String) _candidates;
+  final HttpClient _client;
+  final bool _ownsClient;
   final _pending = <String, Future<Uint8List>>{};
+
+  /// Releases the pooled connections. [shared] lives for the app's lifetime;
+  /// callers that build their own cache own the close.
+  void close() {
+    if (_ownsClient) _client.close(force: true);
+  }
 
   /// Normalises a cover URL without rewriting its CDN resize directive.
   ///
@@ -45,51 +69,46 @@ class ArtworkCache {
         return await cached.readAsBytes();
       } catch (_) {}
     }
-    final client = HttpClient()..autoUncompress = false;
-    try {
-      Object? failure;
-      for (final candidate in _candidates(key)) {
-        try {
-          final uri = Uri.parse(candidate);
-          final request = await client
-              .getUrl(uri)
-              .timeout(const Duration(seconds: 15));
-          artworkHeaders.forEach(request.headers.set);
-          final response = await request.close().timeout(
-            const Duration(seconds: 15),
+    Object? failure;
+    for (final candidate in _candidates(key)) {
+      try {
+        final uri = Uri.parse(candidate);
+        final request = await _client
+            .getUrl(uri)
+            .timeout(const Duration(seconds: 15));
+        artworkHeaders.forEach(request.headers.set);
+        final response = await request.close().timeout(
+          const Duration(seconds: 15),
+        );
+        if (response.statusCode != HttpStatus.ok) {
+          await response.drain<void>();
+          throw NetworkImageLoadException(
+            statusCode: response.statusCode,
+            uri: uri,
           );
-          if (response.statusCode != HttpStatus.ok) {
-            await response.drain<void>();
-            throw NetworkImageLoadException(
-              statusCode: response.statusCode,
-              uri: uri,
-            );
-          }
-          final builder = BytesBuilder(copy: false);
-          await for (final chunk in response.timeout(
-            const Duration(seconds: 15),
-          )) {
-            builder.add(chunk);
-            if (builder.length > 20 * 1024 * 1024) {
-              throw const HttpException('Artwork too large');
-            }
-          }
-          final bytes = builder.takeBytes();
-          if (bytes.isEmpty ||
-              (response.contentLength >= 0 &&
-                  bytes.length != response.contentLength)) {
-            throw const HttpException('Incomplete artwork');
-          }
-          await disk.put(CacheBucket.artwork, key, () => Stream.value(bytes));
-          return bytes;
-        } catch (error) {
-          failure = error;
         }
+        final builder = BytesBuilder(copy: false);
+        await for (final chunk in response.timeout(
+          const Duration(seconds: 15),
+        )) {
+          builder.add(chunk);
+          if (builder.length > 20 * 1024 * 1024) {
+            throw const HttpException('Artwork too large');
+          }
+        }
+        final bytes = builder.takeBytes();
+        if (bytes.isEmpty ||
+            (response.contentLength >= 0 &&
+                bytes.length != response.contentLength)) {
+          throw const HttpException('Incomplete artwork');
+        }
+        await disk.put(CacheBucket.artwork, key, () => Stream.value(bytes));
+        return bytes;
+      } catch (error) {
+        failure = error;
       }
-      throw failure ?? const HttpException('Artwork unavailable');
-    } finally {
-      client.close(force: true);
     }
+    throw failure ?? const HttpException('Artwork unavailable');
   }
 
   Future<File?> file(String url) async {
